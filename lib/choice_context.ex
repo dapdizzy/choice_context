@@ -1,17 +1,27 @@
 defmodule ChoiceContext do
   import Kernel, except: [&&: 2]
 
-  defstruct [:mode, :choices, :function]
+  defstruct [:mode, :choices, :timeout_action]
 
   use GenServer
 
   # API
-  def start_link(timeout, %{} = choices, function) when function |> is_function(1) do
-    __MODULE__ |> GenServer.start_link({timeout, choices, function}, name: __MODULE__)
+  def start_link(timeout, %{} = choices, timeout_action \\ nil) do
+    validate_timeout_action(timeout_action)
+    __MODULE__ |> GenServer.start_link({timeout, choices, timeout_action}, name: __MODULE__)
   end
 
-  def start(timeout, %{} = choices, function) when function |> is_function(1) do
-    __MODULE__ |> GenServer.start({timeout, choices, function}, name: __MODULE__)
+  def start(timeout, %{} = choices, timeout_action \\ nil) do
+    validate_timeout_action(timeout_action)
+    __MODULE__ |> GenServer.start({timeout, choices, timeout_action}, name: __MODULE__)
+  end
+
+  defp validate_timeout_action(nil), do: :ok
+
+  defp validate_timeout_action(timeout_action) do
+    unless timeout_action |> is_function(0) do
+      raise "timeout_action should be a function/0"
+    end
   end
 
   def accept(server \\ __MODULE__, choice) do
@@ -19,33 +29,45 @@ defmodule ChoiceContext do
   end
 
   # Callbacks
-  def init({timeout, choices, function}) do
+  def init({timeout, choices, timeout_action}) do
     self() |> Process.send_after(:timeout, timeout)
-    {:ok, %__MODULE__{mode: :active, choices: choices, function: function}}
+    {:ok, %__MODULE__{mode: :active, choices: choices, timeout_action: timeout_action}}
   end
 
-  def handle_call({:accept, option}, _from, %__MODULE__{mode: :active, choices: choices, function: function} = state) do
+  def handle_call({:accept, option}, _from, %__MODULE__{mode: :active, choices: choices} = state) do
     {options, counter} = parse_option(option)
-    result =
+    {stop, result} =
       case counter do
         1 ->
           [choice] = options
-          choice |> process_choice(function, choices) |> unwrap()
+          choice |> choose_option(choices)
+            |> case do
+              {:choice, chosen_option} -> {true, %{selected_option: chosen_option}}
+              {:invalid_option, invalid_option} -> {false, %{reply: (with x when x != "" <- invalid_option |> invalid_option_string(), do: x && (x <> "\n" <> valid_options_string(choices)))}}
+            end
         n when n |> is_integer() and n > 1->
-          {processed, not_processed} =
+          {valid_options, invalid_options} =
             options |> Stream.map(fn option ->
-              option |> process_choice(function, choices)
-            end) |> Enum.split_with(fn processing_result ->
-              case processing_result do
-                {:ok, _result} -> true
-                {:invalid_option, _description} -> false
+              option |> choose_option(choices)
+            end) |> Enum.split_with(fn choose_result ->
+              case choose_result do
+                {:choice, _valid_option} -> true
+                {:invalid_option, _option} -> false
               end
             end)
-          processed_result = processed |> Stream.map(& unwrap(&1)) |> Enum.join("\n")
-          not_processed_result = with x <- not_processed |> Stream.map(& unwrap(&1)) |> Enum.join("\n"), do: x && (x <> "\n" <> valid_options_string(choices))
-          (processed_result && (processed_result <> (not_processed_result && "\n"))) <> not_processed_result
+          valid_options = valid_options |> Enum.map(& unwrap(&1))
+          invalid_options_string =
+            ((invalid_options |> Stream.map(& unwrap(&1) |> invalid_option_string()))
+            |> Enum.join("\n")) &&& ("\n" <> valid_options_string(choices))
+          # invalid_options_string = with x <- invalid_options |> Stream.map(& unwrap(&1) |> invalid_option_string()) |> Enum.join("\n"), do: x && (x <> "\n" <> valid_options_string(choices))
+          {valid_options |> Enum.count() > 0, %{selected_options: valid_options, reply: invalid_options_string}}
       end
-    {:stop, :normal, {:result, result}, state}
+    reply = {:result, result}
+    if stop do
+      {:stop, :normal, reply, state}
+    else
+      {:reply, reply, state}
+    end
   end
 
   # def handle_call({:accept, _option}, _from, %__MODULE__{mode: :active, choices: choices} = state) do
@@ -56,41 +78,41 @@ defmodule ChoiceContext do
     {:stop, :normal, {:reply, "Too late, the choice context has ended."}, state}
   end
 
-  def handle_info(:timeout, state) do
-    {:noreply, %{state|mode: :inactive}}
+  def handle_info(:timeout, %__MODULE__{mode: mode, timeout_action: timeout_action} = state) do
+    if mode == :active && timeout_action != nil do
+      timeout_action.()
+    end
+    {:stop, :normal, %{state|mode: :inactive}}
   end
 
-  def parse_option(option) do
+  def parse_option(option) when option |> is_binary() do
     option |> String.split(",", trim: true) |> Stream.map(& String.trim(&1))
       |> Enum.map_reduce(0, fn x, counter -> {x, counter + 1} end)
   end
+
+  def parse_option(option), do: {[option], 1}
 
   def choose_option(option, map) do
     case map do
       %{^option => choice} ->
         {:choice, choice}
       _ ->
-        :invalid_option
+        {:invalid_option, option}
     end
   end
 
-  def process_choice(choice, function, choices) do
-    case choice |> choose_option(choices) do
-      {:choice, choice} ->
-        {:ok, function.(choice)}
-      :invalid_option ->
-        {:invalid_option, "Option *#{choice}* is invalid."}
-    end
+  defp invalid_option_string(option) do
+    "Option *#{option}* is invalid."
   end
 
   def valid_options_string(choices) do
     "Valid options are: *#{choices |> Map.keys() |> Enum.join(~S|, |)}*."
   end
 
-  def unwrap(processing_result) do
-    case processing_result do
-      {:ok, result} -> result
-      {:invalid_option, description} -> description
+  def unwrap(choice) do
+    case choice do
+      {:choice, valid_choice} -> valid_choice
+      {:invalid_option, invalid_choice} -> invalid_choice
     end
   end
 
@@ -101,5 +123,11 @@ defmodule ChoiceContext do
     end
   end
 
+  defp if_concat(a, b) do
+    if a && a != "", do: a <> b
+  end
+
   defp a && b, do: swallow(a, b)
+
+  defp a &&& b, do: if_concat(a, b)
 end

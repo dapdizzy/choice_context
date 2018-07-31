@@ -1,10 +1,10 @@
-defmodule ChoiseContext.MixProject do
+defmodule ChoiceContext.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :choise_context,
-      version: "0.1.3",
+      app: :choice_context,
+      version: "0.1.5",
       elixir: "~> 1.6",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -32,7 +32,7 @@ defmodule ChoiseContext.MixProject do
 
   defp description do
     """
-    This is a GenServer-ish implementation of a Choise Context.
+    This is a GenServer-ish implementation of a Choice Context.
     That is a process that accepts a value during the specified period of time and refuses to do so after the timeout has elapsed.
     """
   end
